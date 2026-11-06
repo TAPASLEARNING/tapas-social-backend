@@ -180,7 +180,7 @@ OAUTH_PROVIDERS = {
  "x": {
   "auth":"https://x.com/i/oauth2/authorize","token":"https://api.x.com/2/oauth2/token",
   "client_id":"X_CLIENT_ID","client_secret":"X_CLIENT_SECRET",
-  "scopes":["users.read","tweet.read","follows.read","offline.access"],"pkce":True,"basic":False,
+  "scopes":["users.read","tweet.read","follows.read","offline.access"],"pkce":True,"basic":True,
   "userinfo":"https://api.x.com/2/users/me?user.fields=public_metrics"
  },
  "spotify": {
@@ -214,6 +214,17 @@ async def http_json(method: str, url: str, *, headers=None, params=None, data=No
         return response.json()
 
 
+def _body_auth(provider: str) -> bool:
+    # Providers listed in BODY_AUTH_PROVIDERS send client_id + client_secret as form
+    # fields instead of an HTTP Basic header. Needed when the client secret is held in
+    # Muse's Secure Vault and injected into this process as a surrogate value: a Basic
+    # header would base64-encode the surrogate so the vault egress swap could not match
+    # it, while a literal form field passes through untouched. Spotify's token endpoint
+    # accepts credentials in the request body. On a normal PC install (real secret in
+    # .env, BODY_AUTH_PROVIDERS unset) behaviour is unchanged.
+    return provider in {p.strip() for p in os.getenv("BODY_AUTH_PROVIDERS", "").split(",") if p.strip()}
+
+
 async def exchange_code(provider: str, code: str, redirect_uri: str, verifier: str | None, instance: str | None, extra_json: str | None = None) -> dict:
     cfg = dict(OAUTH_PROVIDERS[provider]) if provider in OAUTH_PROVIDERS else {}
     client_id = os.getenv(cfg["client_id"], "") if cfg else ""
@@ -231,6 +242,10 @@ async def exchange_code(provider: str, code: str, redirect_uri: str, verifier: s
         raise HTTPException(400, f"{provider} app credentials are not configured on the backend.")
     payload = {"grant_type":"authorization_code","code":code,"redirect_uri":redirect_uri}
     auth = (client_id, client_secret) if cfg.get("basic") and client_secret else None
+    if auth and _body_auth(provider):
+        payload["client_id"] = client_id
+        payload["client_secret"] = client_secret
+        auth = None
     if not auth:
         payload["client_id"] = client_id
         if client_secret and not cfg.get("basic"):
@@ -328,6 +343,10 @@ async def refresh_access_token(provider: str, connection: dict) -> dict:
         token_url=cfg["token"]
         payload={"grant_type":"refresh_token","refresh_token":refresh}
         auth=(cid,secret) if cfg.get("basic") and secret else None
+        if auth and _body_auth(provider):
+            payload["client_id"]=cid
+            payload["client_secret"]=secret
+            auth=None
         if not auth and cid:
             payload["client_id"]=cid
         if secret and not cfg.get("basic"):
