@@ -55,3 +55,46 @@ Google AI Pro / Antigravity authentication is for the local development environm
 ## Validation
 
 GitHub Actions compiles the Python backend, syntax-checks the JavaScript and runs offline smoke tests for health, provider catalogue, Gemini fail-closed behavior, discovery-rule CRUD, recurring schedule approval, missing OAuth configuration and encryption. These tests do not authenticate or make live provider API calls.
+
+## Release 1.3 — publication detection
+
+Release 1.3 adds publication *detection* on the unchanged 1.2 spine. It ports the audited-good parts of an external "Gemini Core" starter (Substack RSS detection, the optimizer's enriched output fields, its no-promises system prompt) and rejects the rest (a parallel app and database, static-token provider auth, Google Ads / paid-promotion plumbing, `uvicorn[standard]`).
+
+- **Detectors** (`services/publication_engine.py` + server wiring) observe Ram's own publications only, through authorized routes: Substack's public RSS feed (no auth), and the existing OAuth connections for YouTube (uploads playlist via the Data API) and LinkedIn (own-posts read attempted via the REST API — LinkedIn currently refuses it because the app lacks the `r_member_social` permission; the endpoint reports `permission_denied` with that exact gap and never scrapes).
+- **Register + dedup:** detections land in a `publications` table with `UNIQUE(platform, external_id)`; repeat runs register nothing twice (verified live and in tests).
+- **Optimize + approve:** each new publication is optimized by the existing Gemini engine (fail-closed, HTTP 503 without a key) into an enriched record — title, description, keywords, hashtags, a 40–80 word answer snippet, entity map, schema and GEO recommendations, audience, hook options, CTA, **risk flags** and a **confidence score** — and queued as a *pending* item in the existing approval queue with a 72-hour expiry. Detection never publishes, posts or promotes anything; every optimization is a draft for human decision.
+- **Scheduling:** a `publication_detection` job (default every 30 minutes, `PUBLICATION_DETECTION_INTERVAL_MINUTES`) runs under the 1.2 scheduler policy — fixed id, coalesce, misfire grace, single instance.
+- **Endpoints:** `GET /api/publications`, `POST /api/publications/detect`, `POST /api/publications/analyze` (the starter's `/v1/analyze`, on this API's surface and auth model), `POST /api/publications/reoptimize`.
+- **Burst resilience:** Gemini's free tier rate-limits back-to-back optimization calls during a first-scan backfill (live on day one: roughly half of a 45-publication burst). Optimizations therefore retry once after a 20-second backoff, failures are recorded per publication (`optimization_error` on its approval) instead of being hidden, and `/api/publications/reoptimize` re-fetches source text and fills failed optimizations with pacing. The steady-state cadence (a few new publications per 30-minute cycle) stays well under the limit.
+- **Out of scope, deliberately:** Google Ads / YouTube Promote and all paid promotion (no advertiser authorization exists); cross-platform attribution beyond the existing per-provider analytics snapshots; LinkedIn detection beyond the permission-gated attempt above.
+- **Tests:** 46 offline tests (30 smoke + 7 reliability + 9 publication), each suite in its own process.
+
+## Release 1.2 — runtime reliability
+
+Release 1.2 is a reliability release: no new growth features, and no v1/1.1 route, table or behaviour removed. It fixes the failure mode where the backend silently disappeared when its shell session, host or process ended.
+
+- **Persistent service (Linux):** the backend runs as a systemd system service (`deploy/tapas-growth-backend.service`) with `Restart=always` — it survives session logout, restarts automatically after a crash, and starts at boot. It is no longer a child of any shell.
+- **Watchdog:** a systemd timer (`deploy/tapas-backend-watchdog.timer`) probes `/api/health` every minute; two consecutive failures restart the service and write an ALERT line to the watchdog alert log. Crash recovery is systemd's job; the watchdog covers the process-alive-but-unresponsive case.
+- **Scheduler reliability:** APScheduler jobs use fixed ids with `replace_existing=True` (no duplicate registrations), `coalesce=True` and `misfire_grace_time=300` (runs missed during downtime collapse into one catch-up run instead of being dropped or duplicated), and `max_instances=1` (no overlapping executions). Schedules whose `next_run_at` passed during downtime are counted in the startup log and picked up by the one-minute schedules job — that is the defined missed-job recovery path.
+- **Observability:** `/api/health` now reports `version`, `uptime_seconds` and the live scheduler job ids; startup/shutdown are logged (journald under systemd) with the job list and missed-schedule count.
+- **Approval workflow:** pending approvals now carry an `expires_at` (default 72h, `APPROVAL_TTL_HOURS`). Deciding an expired item transitions it to `expired`, writes a tamper-evident audit entry and returns HTTP 410; `POST /api/approvals/{id}/renew` returns an expired item to `pending_approval` with a fresh expiry, also audited.
+- **Provider verification:** live OAuth refresh + analytics sync verified for LinkedIn and YouTube; Gemini generation verified live. X analytics remains limited by the account's API credit balance (HTTP 402 from X — an account state, not a backend fault).
+- **Deployment & rollback:** see `deploy/DEPLOYMENT.md` for the checklist, the VM-replacement restore script and the rollback procedure (previous release = git tag `v1.1`; code rollback is a checkout of that tag, service rollback is re-running its restore).
+
+## Release 1.1 — capabilities
+
+An additive service layer (`services/`) ported onto the unchanged v1 backend. No v1 route, table or behaviour was modified; Gemini-backed endpoints fail closed (HTTP 503) when `GEMINI_API_KEY` is not configured, and no service fabricates metrics — unavailable data is reported as `unconfigured`, `permission_denied` (null value) or an explicit requirement.
+
+Services:
+
+- `services/youtube_engine.py` — the 12 content pillars, Gemini title evaluation (10 ranked suggestions), YouTube Analytics retention reports (raw ratios preserved), retention-optimisation guidance, deterministic thumbnail briefs, Shorts script drafts.
+- `services/github_engine.py` — public repository statistics (no token needed), traffic metrics with honest `permission_denied`/null handling, Gemini README improvement suggestions, release launch kits with an embedded ethical-growth note (no bot stars, no exchanges).
+- `services/search_geo_engine.py` — Gemini AEO generation with Schema.org FAQPage JSON-LD; deterministic GEO entity audit of submitted text (CHANGEReadyX™ trademark check, diagnostic link, attributed-statistic heuristic); keyword research with `search_volume: null` (no volume source connected — nothing invented); canonical entity registry.
+- `services/content_studio_engine.py` — one topic in, a full cross-platform draft bundle out (stored in `content_studio_bundles`).
+- `services/cross_platform_engine.py` — platform-native drafts from source text; drafts only, never published.
+- `services/experimentation_engine.py` — two-proportion z-test (pure stdlib) for A/B growth experiments.
+- `services/approval_workflow_engine.py` — approval queue plus a tamper-evident, hash-chained audit log. A gate and a record only; it publishes nothing.
+
+New endpoints: `GET /api/dashboard/summary`, `GET /api/youtube/pillars`, `POST /api/youtube/titles/evaluate`, `POST /api/youtube/retention`, `POST /api/youtube/retention/optimize`, `POST /api/youtube/shorts/generate`, `POST /api/youtube/thumbnail/brief`, `POST /api/youtube/thumbnails/analyze`, `GET /api/youtube/videos`, `GET /api/github/stats`, `POST /api/github/audit`, `POST /api/github/launch-kit`, `POST /api/search/aeo/generate`, `POST /api/search/geo/audit`, `GET /api/search/seo/status`, `POST /api/search/keywords/research`, `GET /api/search/entities`, `POST /api/studio/generate-bundle`, `GET /api/studio/bundles`, `POST /api/crossplatform/draft`, `GET|POST /api/experiments`, `POST /api/experiments/evaluate`, `GET /api/approvals/queue`, `POST /api/approvals`, `POST /api/approvals/{id}/action`, `GET /api/audit-logs`.
+
+Optional configuration: `GITHUB_TOKEN` (public stats need no token; traffic metrics need push access). Live SEO metrics remain unavailable until a Google Search Console integration is configured — `GET /api/search/seo/status` says so rather than inventing findings.

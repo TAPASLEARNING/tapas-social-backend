@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -14,7 +15,33 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import httpx
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+except ImportError:  # pragma: no cover - apscheduler is a declared dependency
+    import logging as _logging
+
+    _logging.getLogger(__name__).warning(
+        "apscheduler is not installed; background scheduling is disabled (no-op scheduler)."
+    )
+
+    class AsyncIOScheduler:  # type: ignore[no-redef]
+        """Minimal fallback so the API still runs without apscheduler."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.running = False
+
+        def add_job(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def get_jobs(self) -> list:
+            return []
+
+        def start(self) -> None:
+            self.running = False
+
+        def shutdown(self, wait: bool = False) -> None:
+            self.running = False
+
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -33,7 +60,33 @@ FRONTEND_ORIGIN = os.getenv("TAPAS_FRONTEND_ORIGIN") or "http://127.0.0.1:8000"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
 GRAPH_API_VERSION = os.getenv("META_GRAPH_API_VERSION") or "v25.0"
 LINKEDIN_VERSION = os.getenv("LINKEDIN_VERSION") or "202610"
-scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
+import logging as _logging
+
+log = _logging.getLogger("tapas-growth-autopilot")
+if not log.handlers:
+    _handler = _logging.StreamHandler()
+    _handler.setFormatter(_logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    log.addHandler(_handler)
+    log.setLevel(_logging.INFO)
+
+APP_VERSION = "1.3.0"
+_STARTED_AT = time.time()
+
+# v1.2 scheduler reliability policy:
+# - Fixed job ids + replace_existing=True (see lifespan) mean a job can never
+#   be registered twice, even across repeated lifespan starts.
+# - coalesce=True collapses runs missed while the process was down into ONE
+#   catch-up run instead of a burst of duplicates.
+# - misfire_grace_time=300 keeps a job eligible for that catch-up run for
+#   five minutes after its slot instead of silently dropping it.
+# - max_instances=1 prevents overlapping executions of the same job.
+# Missed-job recovery: rows in the `schedules` table whose next_run_at is in
+# the past are counted at startup (see lifespan) and are picked up by the
+# one-minute `schedules` job within a minute of recovery.
+scheduler = AsyncIOScheduler(
+    timezone="Asia/Kolkata",
+    job_defaults={"coalesce": True, "misfire_grace_time": 300, "max_instances": 1},
+)
 
 
 @contextmanager
@@ -100,7 +153,68 @@ def init_db() -> None:
           collected_at TEXT NOT NULL, metrics_json TEXT NOT NULL,
           provenance TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS youtube_videos(
+          id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', description TEXT,
+          published_at TEXT, format TEXT NOT NULL DEFAULT 'long-form', pillar_id TEXT,
+          views INTEGER DEFAULT 0, impressions INTEGER DEFAULT 0, ctr REAL DEFAULT 0.0,
+          watch_time_minutes REAL DEFAULT 0.0, avg_view_duration_seconds REAL DEFAULT 0.0,
+          avg_percentage_viewed REAL DEFAULT 0.0, subscribers_gained INTEGER DEFAULT 0,
+          likes INTEGER DEFAULT 0, comments INTEGER DEFAULT 0,
+          search_traffic_percent REAL DEFAULT 0.0, browse_traffic_percent REAL DEFAULT 0.0,
+          suggested_traffic_percent REAL DEFAULT 0.0, external_traffic_percent REAL DEFAULT 0.0,
+          last_updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS growth_experiments(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, hypothesis TEXT NOT NULL,
+          target_audience TEXT, content_format TEXT, test_variable TEXT,
+          variants_json TEXT, baseline_json TEXT, results_json TEXT,
+          status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, evaluated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS approval_queue(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, action_type TEXT NOT NULL, platform TEXT NOT NULL,
+          title TEXT NOT NULL, payload_json TEXT NOT NULL, proposed_by TEXT,
+          status TEXT NOT NULL DEFAULT 'pending_approval', risk_level TEXT NOT NULL DEFAULT 'High',
+          created_at TEXT NOT NULL, approved_by TEXT, approved_at TEXT, decision_notes TEXT
+        );
+        CREATE TABLE IF NOT EXISTS audit_logs(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, event_type TEXT NOT NULL,
+          actor TEXT NOT NULL, target_entity TEXT NOT NULL, outcome TEXT NOT NULL,
+          details_json TEXT NOT NULL, tamper_proof_checksum TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS keywords(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, keyword TEXT NOT NULL UNIQUE, search_intent TEXT,
+          audience_segment TEXT, topic_cluster TEXT, funnel_stage TEXT,
+          relevance_score REAL, confidence REAL, source TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS content_studio_bundles(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, bundle_json TEXT NOT NULL,
+          created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', pillar_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS github_snapshots(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, collected_at TEXT NOT NULL, stars INTEGER NOT NULL,
+          forks INTEGER NOT NULL, open_issues INTEGER NOT NULL, watchers INTEGER NOT NULL,
+          metrics_json TEXT NOT NULL, provenance TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS publications(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL, external_id TEXT NOT NULL,
+          url TEXT NOT NULL, title TEXT, published_at TEXT, content_hash TEXT,
+          optimization_json TEXT, approval_id INTEGER, detected_at TEXT NOT NULL,
+          UNIQUE(platform, external_id)
+        );
         """)
+        # v1.2 migration: approval expiry. Older databases have no
+        # expires_at column on approval_queue; add it additively.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(approval_queue)")]
+        if "expires_at" not in cols:
+            conn.execute("ALTER TABLE approval_queue ADD COLUMN expires_at TEXT")
+
+
+# v1.2: pending approvals expire after this many hours (env-overridable).
+APPROVAL_TTL_HOURS = max(1, int(os.getenv("APPROVAL_TTL_HOURS") or "72"))
+
+
+def _approval_expires_at() -> str:
+    return iso(utc_now() + timedelta(hours=APPROVAL_TTL_HOURS))
 
 
 def cipher() -> Fernet:
@@ -613,6 +727,24 @@ async def safe_background_schedules():
         pass
 
 
+def count_missed_schedules() -> int:
+    """Schedules whose next_run_at passed while the backend was down.
+
+    They are not lost: process_due_schedules (the one-minute `schedules`
+    job) picks up every due row, so recovery completes within a minute of
+    startup. This count exists so the recovery is visible in the logs.
+    """
+    try:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM schedules WHERE next_run_at IS NOT NULL AND next_run_at < ?",
+                (iso(),),
+            ).fetchone()
+            return int(row["n"]) if row else 0
+    except Exception:
+        return 0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -620,12 +752,18 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(safe_background_schedules,"interval",minutes=1,id="schedules",replace_existing=True)
     if os.getenv("ANALYTICS_AUTO_SYNC_ENABLED","false").strip().lower() == "true":
         scheduler.add_job(safe_background_analytics,"interval",minutes=max(15,int(os.getenv("ANALYTICS_SYNC_INTERVAL_MINUTES") or "60")),id="analytics",replace_existing=True)
+    if os.getenv("PUBLICATION_DETECTION_ENABLED","true").strip().lower() == "true":
+        scheduler.add_job(safe_publication_detection,"interval",minutes=max(15,int(os.getenv("PUBLICATION_DETECTION_INTERVAL_MINUTES") or "30")),id="publication_detection",replace_existing=True)
     scheduler.start()
+    missed = count_missed_schedules()
+    jobs = [(j.id, str(j.next_run_time)) for j in scheduler.get_jobs()]
+    log.info("startup version=%s scheduler_jobs=%s missed_schedules_pending_recovery=%s", APP_VERSION, jobs, missed)
     yield
     scheduler.shutdown(wait=False)
+    log.info("shutdown version=%s", APP_VERSION)
 
 
-app=FastAPI(title="TAPAS Growth Autopilot API",version="0.2.0",lifespan=lifespan)
+app=FastAPI(title="TAPAS Growth Autopilot API",version=APP_VERSION,lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[FRONTEND_ORIGIN,"http://127.0.0.1:4173","http://localhost:4173"],allow_credentials=False,allow_methods=["GET","POST","DELETE","OPTIONS"],allow_headers=["Content-Type","Authorization","X-Tapas-Admin-Token"])
 
 @app.get("/",response_class=HTMLResponse)
@@ -648,7 +786,7 @@ async def script():
 
 @app.get("/api/health")
 async def health():
-    return {"ok":True,"service":"TAPAS Growth Autopilot API","mode":"private-local","time":iso(),"gemini_configured":bool(gemini_key()),"scheduler_running":scheduler.running}
+    return {"ok":True,"service":"TAPAS Growth Autopilot API","version":APP_VERSION,"mode":"private-local","time":iso(),"uptime_seconds":round(time.time()-_STARTED_AT,1),"gemini_configured":bool(gemini_key()),"scheduler_running":scheduler.running,"scheduler_jobs":[j.id for j in scheduler.get_jobs()] if scheduler.running else []}
 
 
 @app.get("/api/status")
@@ -1015,3 +1153,821 @@ async def analytics_snapshots(limit: int=50):
 async def shutdown_event():
     if scheduler.running:
         scheduler.shutdown(wait=False)
+
+
+# ---------------------------------------------------------------------------
+# Release 1.1 capabilities (additive layer on the v1 core)
+# New services in services/; no v1 route, table or behaviour is changed.
+# Gemini-backed endpoints fail closed with HTTP 503 when GEMINI_API_KEY is
+# not configured, mirroring /api/ai/comments.
+# ---------------------------------------------------------------------------
+from services.approval_workflow_engine import write_audit_log  # noqa: E402
+from services.content_studio_engine import ContentStudio  # noqa: E402
+from services.cross_platform_engine import CrossPlatformEngine  # noqa: E402
+from services.experimentation_engine import two_proportion_ztest  # noqa: E402
+from services.gemini_client import GeminiNotConfigured, NOT_CONFIGURED_MESSAGE  # noqa: E402
+from services.github_engine import GitHubGrowthEngine  # noqa: E402
+from services.search_geo_engine import CANONICAL_ENTITIES, SEOAEOGEOEngine, geo_audit, seo_status  # noqa: E402
+from services.youtube_engine import PILLARS, YouTubeGrowthEngine  # noqa: E402
+from services.publication_engine import content_hash as publication_content_hash, fetch_feed_text, optimize_publication, parse_rss_feed  # noqa: E402
+
+
+def _gemini_503() -> HTTPException:
+    return HTTPException(503, NOT_CONFIGURED_MESSAGE)
+
+
+class TitleEvaluateRequest(BaseModel):
+    topic: str = Field(min_length=2, max_length=300)
+    current_title: str = Field(default="", max_length=300)
+
+
+class RetentionRequest(BaseModel):
+    video_id: str = Field(min_length=1, max_length=120)
+
+
+class ThumbnailBriefRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+
+
+class ThumbnailAnalyzeRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    brief: str = Field(default="", max_length=4000)
+
+
+class RetentionOptimizeRequest(BaseModel):
+    topic: str = Field(min_length=2, max_length=300)
+    duration_seconds: int | None = Field(default=None, ge=10, le=14400)
+
+
+class ShortsGenerateRequest(BaseModel):
+    topic: str = Field(min_length=2, max_length=300)
+    pillar: str | None = Field(default=None, max_length=200)
+
+
+class AEOGenerateRequest(BaseModel):
+    topic: str = Field(min_length=2, max_length=300)
+
+
+class GeoAuditRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=20000)
+
+
+class KeywordsResearchRequest(BaseModel):
+    topic: str = Field(min_length=2, max_length=300)
+
+
+class StudioBundleRequest(BaseModel):
+    topic: str = Field(min_length=2, max_length=300)
+    target_audience: str = Field(default="CHROs, OD leaders, GCC heads and transformation executives", max_length=500)
+    primary_goal: str = Field(default="Drive qualified consulting inquiries and establish thought leadership", max_length=500)
+    pillar: str | None = Field(default=None, max_length=200)
+
+
+class CrossPlatformDraftRequest(BaseModel):
+    topic: str = Field(min_length=2, max_length=300)
+    source_text: str = Field(min_length=10, max_length=12000)
+
+
+class LaunchKitRequest(BaseModel):
+    version: str = Field(min_length=1, max_length=60)
+    highlights: list[str] = Field(default_factory=list, max_length=30)
+
+
+class ExperimentCreateRequest(BaseModel):
+    title: str = Field(min_length=2, max_length=300)
+    hypothesis: str = Field(min_length=2, max_length=2000)
+    target_audience: str = Field(default="", max_length=500)
+    content_format: str = Field(default="", max_length=200)
+    test_variable: str = Field(default="", max_length=200)
+    variants: list[Any] = Field(default_factory=list)
+    baseline: dict[str, Any] | None = None
+
+
+class VariantStats(BaseModel):
+    conversions: int = Field(ge=0)
+    n: int = Field(ge=0)
+
+
+class ExperimentEvaluateRequest(BaseModel):
+    experiment_id: int
+    a: VariantStats
+    b: VariantStats
+
+
+class ApprovalCreateRequest(BaseModel):
+    action_type: str = Field(min_length=1, max_length=120)
+    platform: str = Field(min_length=1, max_length=120)
+    title: str = Field(min_length=1, max_length=300)
+    payload: Any = None
+    proposed_by: str = Field(default="", max_length=200)
+    risk_level: str = Field(default="High", max_length=40)
+
+
+class ApprovalActionRequest(BaseModel):
+    decision: str = Field(min_length=1, max_length=20)
+    actor: str = Field(min_length=1, max_length=200)
+    notes: str = Field(default="", max_length=2000)
+
+
+class ApprovalRenewRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=200)
+    notes: str = Field(default="", max_length=2000)
+
+
+@app.get("/api/dashboard/summary")
+async def dashboard_summary():
+    status_data = await status()
+    with db() as conn:
+        counts = {
+            "schedules": conn.execute("SELECT COUNT(*) AS c FROM schedules").fetchone()["c"],
+            "discovery_items": conn.execute("SELECT COUNT(*) AS c FROM discovery_items").fetchone()["c"],
+            "discovery_rules": conn.execute("SELECT COUNT(*) AS c FROM discovery_rules").fetchone()["c"],
+            "studio_bundles": conn.execute("SELECT COUNT(*) AS c FROM content_studio_bundles").fetchone()["c"],
+            "pending_approvals": conn.execute("SELECT COUNT(*) AS c FROM approval_queue WHERE status='pending_approval'").fetchone()["c"],
+            "experiments": conn.execute("SELECT COUNT(*) AS c FROM growth_experiments").fetchone()["c"],
+            "youtube_videos_stored": conn.execute("SELECT COUNT(*) AS c FROM youtube_videos").fetchone()["c"],
+        }
+        snapshot = conn.execute("SELECT * FROM github_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+    youtube_conn = get_connection("youtube")
+    return {
+        "generated_at": iso(),
+        "connections": status_data["providers"],
+        "gemini": status_data["gemini"],
+        "scheduler": status_data["scheduler"],
+        "counts": counts,
+        "latest_github_snapshot": dict(snapshot) if snapshot else None,
+        "youtube": {
+            "connected": bool(youtube_conn and youtube_conn.get("status") == "connected"),
+            "stored_token_present": bool(youtube_conn and youtube_conn.get("access_token_enc")),
+        },
+        "note": "Aggregates real local state only; no KPIs are estimated or invented.",
+    }
+
+
+@app.get("/api/youtube/pillars")
+async def youtube_pillars():
+    return {"pillars": PILLARS, "count": len(PILLARS)}
+
+
+@app.post("/api/youtube/titles/evaluate")
+async def youtube_titles_evaluate(payload: TitleEvaluateRequest):
+    try:
+        return await YouTubeGrowthEngine().evaluate_titles(payload.topic, payload.current_title)
+    except GeminiNotConfigured:
+        raise _gemini_503()
+
+
+@app.post("/api/youtube/retention")
+async def youtube_retention(payload: RetentionRequest):
+    try:
+        token, _connection = await access_token("youtube")
+    except HTTPException:
+        token = None
+    return await YouTubeGrowthEngine().retention_report(payload.video_id, token)
+
+
+@app.post("/api/youtube/retention/optimize")
+async def youtube_retention_optimize(payload: RetentionOptimizeRequest):
+    try:
+        return await YouTubeGrowthEngine().retention_optimize(payload.topic, payload.duration_seconds)
+    except GeminiNotConfigured:
+        raise _gemini_503()
+
+
+@app.post("/api/youtube/shorts/generate")
+async def youtube_shorts_generate(payload: ShortsGenerateRequest):
+    try:
+        return await YouTubeGrowthEngine().generate_shorts_script(payload.topic, payload.pillar)
+    except GeminiNotConfigured:
+        raise _gemini_503()
+
+
+@app.post("/api/youtube/thumbnail/brief")
+async def youtube_thumbnail_brief(payload: ThumbnailBriefRequest):
+    return YouTubeGrowthEngine().thumbnail_brief(payload.title)
+
+
+@app.post("/api/youtube/thumbnails/analyze")
+async def youtube_thumbnails_analyze(payload: ThumbnailAnalyzeRequest):
+    result = YouTubeGrowthEngine().thumbnail_brief(payload.title)
+    result["input_brief"] = payload.brief
+    return result
+
+
+@app.get("/api/youtube/videos")
+async def youtube_videos():
+    with db() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM youtube_videos ORDER BY published_at DESC")]
+    return {"videos": rows, "count": len(rows)}
+
+
+@app.get("/api/github/stats")
+async def github_stats():
+    engine = GitHubGrowthEngine()
+    try:
+        result = await engine.get_repository_metrics()
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"GitHub API request failed: {exc}")
+    if result.get("status") == "success":
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO github_snapshots(collected_at,stars,forks,open_issues,watchers,metrics_json,provenance) VALUES(?,?,?,?,?,?,?)",
+                (result["collected_at"], result.get("stars") or 0, result.get("forks") or 0,
+                 result.get("open_issues") or 0, result.get("watchers") or 0,
+                 json.dumps(result), result.get("provenance", "GitHub REST API")),
+            )
+    return result
+
+
+@app.post("/api/github/audit")
+async def github_audit():
+    try:
+        improvements = await GitHubGrowthEngine().generate_readme_improvements()
+    except GeminiNotConfigured:
+        raise _gemini_503()
+    return {"repository": "tapasadvisory/tapas-growth-autopilot", "improvements": improvements}
+
+
+@app.post("/api/github/launch-kit")
+async def github_launch_kit(payload: LaunchKitRequest):
+    try:
+        return await GitHubGrowthEngine().generate_launch_kit(payload.version, payload.highlights)
+    except GeminiNotConfigured:
+        raise _gemini_503()
+
+
+@app.post("/api/search/aeo/generate")
+async def search_aeo_generate(payload: AEOGenerateRequest):
+    try:
+        return await SEOAEOGEOEngine().generate_aeo(payload.topic)
+    except GeminiNotConfigured:
+        raise _gemini_503()
+
+
+@app.post("/api/search/geo/audit")
+async def search_geo_audit(payload: GeoAuditRequest):
+    return geo_audit(payload.text)
+
+
+@app.get("/api/search/seo/status")
+async def search_seo_status():
+    return seo_status()
+
+
+@app.post("/api/search/keywords/research")
+async def search_keywords_research(payload: KeywordsResearchRequest):
+    try:
+        result = await SEOAEOGEOEngine().research_keywords(payload.topic)
+    except GeminiNotConfigured:
+        raise _gemini_503()
+    with db() as conn:
+        for item in result.get("keywords") or []:
+            conn.execute(
+                """INSERT OR IGNORE INTO keywords(keyword,search_intent,audience_segment,topic_cluster,funnel_stage,relevance_score,confidence,source,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (item.get("keyword"), item.get("search_intent"), None, item.get("topic_cluster"),
+                 item.get("funnel_stage"), item.get("relevance_score"), item.get("confidence"),
+                 "gemini_keyword_model", iso()),
+            )
+    return result
+
+
+@app.get("/api/search/entities")
+async def search_entities():
+    return {"entities": CANONICAL_ENTITIES, "count": len(CANONICAL_ENTITIES)}
+
+
+@app.post("/api/studio/generate-bundle")
+async def studio_generate_bundle(payload: StudioBundleRequest):
+    try:
+        bundle = await ContentStudio().generate_bundle(payload.topic, payload.target_audience, payload.primary_goal)
+    except GeminiNotConfigured:
+        raise _gemini_503()
+    with db() as conn:
+        cursor = conn.execute(
+            "INSERT INTO content_studio_bundles(topic,bundle_json,created_at,status,pillar_id) VALUES(?,?,?,?,?)",
+            (payload.topic, json.dumps(bundle), iso(), "draft", payload.pillar),
+        )
+        bundle_id = cursor.lastrowid
+    return {"id": bundle_id, **bundle}
+
+
+@app.get("/api/studio/bundles")
+async def studio_bundles():
+    with db() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT id,topic,created_at,status,pillar_id FROM content_studio_bundles ORDER BY id DESC")]
+    return {"bundles": rows, "count": len(rows)}
+
+
+@app.post("/api/crossplatform/draft")
+async def crossplatform_draft(payload: CrossPlatformDraftRequest):
+    try:
+        return await CrossPlatformEngine().generate_drafts(payload.topic, payload.source_text)
+    except GeminiNotConfigured:
+        raise _gemini_503()
+
+
+@app.get("/api/experiments")
+async def experiments_list():
+    with db() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM growth_experiments ORDER BY id DESC")]
+    for row in rows:
+        for field in ("variants_json", "baseline_json", "results_json"):
+            row[field.replace("_json", "")] = json.loads(row.pop(field)) if row.get(field) else None
+    return {"experiments": rows, "count": len(rows)}
+
+
+@app.post("/api/experiments")
+async def experiments_create(payload: ExperimentCreateRequest):
+    with db() as conn:
+        cursor = conn.execute(
+            """INSERT INTO growth_experiments(title,hypothesis,target_audience,content_format,test_variable,variants_json,baseline_json,status,created_at)
+               VALUES(?,?,?,?,?,?,?,'active',?)""",
+            (payload.title, payload.hypothesis, payload.target_audience, payload.content_format,
+             payload.test_variable, json.dumps(payload.variants), json.dumps(payload.baseline), iso()),
+        )
+        experiment_id = cursor.lastrowid
+        row = dict(conn.execute("SELECT * FROM growth_experiments WHERE id=?", (experiment_id,)).fetchone())
+    row["variants"] = payload.variants
+    row["baseline"] = payload.baseline
+    row.pop("variants_json", None)
+    row.pop("baseline_json", None)
+    row.pop("results_json", None)
+    return row
+
+
+@app.post("/api/experiments/evaluate")
+async def experiments_evaluate(payload: ExperimentEvaluateRequest):
+    try:
+        result = two_proportion_ztest(payload.a.conversions, payload.a.n, payload.b.conversions, payload.b.n)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    with db() as conn:
+        row = conn.execute("SELECT * FROM growth_experiments WHERE id=?", (payload.experiment_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Experiment not found.")
+        conn.execute(
+            "UPDATE growth_experiments SET results_json=?,evaluated_at=?,status='evaluated' WHERE id=?",
+            (json.dumps(result), iso(), payload.experiment_id),
+        )
+        write_audit_log(
+            conn,
+            timestamp=iso(),
+            event_type="experiment.evaluated",
+            actor="system",
+            target_entity=f"experiment:{payload.experiment_id}",
+            outcome=result["decision"],
+            details={"z_score": result["z_score"], "p_value": result["p_value"]},
+        )
+    return {"experiment_id": payload.experiment_id, "status": "evaluated", **result}
+
+
+# ---------------------------------------------------------------------------
+# Release 1.3 — publication detection (LinkedIn / YouTube / Substack)
+#
+# Detectors observe Ram's OWN publications only, through authorized routes:
+# Substack's public RSS feed, and the existing OAuth connections for
+# YouTube and LinkedIn. Every NEW publication is deduplicated into the
+# `publications` register (UNIQUE(platform, external_id)), optimized via
+# the Gemini engine, and queued as a PENDING approval — detection never
+# publishes, posts or promotes anything. Paid promotion is out of scope.
+# ---------------------------------------------------------------------------
+
+SUBSTACK_FEED_DEFAULT = "https://ramchangereadyx.substack.com/feed"
+
+
+async def _register_publication(pub: dict, precomputed_optimization: dict | None = None) -> dict | None:
+    """Insert one publication if new; optimize + queue approval. None if dup."""
+    if not pub.get("content_hash"):
+        pub = {**pub, "content_hash": publication_content_hash(
+            pub.get("title") or "", pub.get("text") or "", pub.get("url") or "")}
+    with db() as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO publications(platform,external_id,url,title,published_at,content_hash,detected_at)
+               VALUES(?,?,?,?,?,?,?)""",
+            (pub["platform"], pub["external_id"], pub["url"], pub.get("title"),
+             pub.get("published_at"), pub.get("content_hash"), iso()),
+        )
+        if cur.rowcount == 0:
+            return None
+        pub_id = cur.lastrowid
+    optimization: dict | None = precomputed_optimization
+    opt_error: str | None = None
+    if optimization is None:
+        optimization, opt_error = await _optimize_with_retry(pub)
+    with db() as conn:
+        conn.execute(
+            "UPDATE publications SET optimization_json=? WHERE id=?",
+            (json.dumps(optimization) if optimization else None, pub_id),
+        )
+        payload = {
+            "publication": {k: pub.get(k) for k in ("platform", "external_id", "url", "title", "published_at", "content_hash")},
+            "optimization": optimization,
+            "optimization_error": opt_error,
+            "channel": "organic",
+            "source": "publication-detection",
+        }
+        cur = conn.execute(
+            """INSERT INTO approval_queue(action_type,platform,title,payload_json,proposed_by,status,risk_level,created_at,expires_at)
+               VALUES(?,?,?,?,?,'pending_approval',?,?,?)""",
+            ("publication_optimization", pub["platform"],
+             f"Optimize detected publication: {(pub.get('title') or pub['external_id'])[:240]}",
+             json.dumps(payload), "publication-engine", "Medium", iso(), _approval_expires_at()),
+        )
+        approval_id = cur.lastrowid
+        conn.execute("UPDATE publications SET approval_id=? WHERE id=?", (approval_id, pub_id))
+        write_audit_log(
+            conn,
+            timestamp=iso(),
+            event_type="publication.detected",
+            actor="publication-engine",
+            target_entity=f"publication:{pub['platform']}:{pub_id}",
+            outcome="pending_approval",
+            details={"approval_id": approval_id, "optimization_error": opt_error},
+        )
+    return {"id": pub_id, "platform": pub["platform"], "external_id": pub["external_id"],
+            "title": pub.get("title"), "approval_id": approval_id, "optimization_error": opt_error}
+
+
+async def _optimize_with_retry(pub: dict) -> tuple[dict | None, str | None]:
+    """Optimize once; on a transient provider error (Gemini free-tier rate
+    limits bite during detection bursts), wait and retry exactly once."""
+    try:
+        return await optimize_publication(pub), None
+    except GeminiNotConfigured:
+        return None, "gemini_not_configured"
+    except Exception:
+        pass
+    await asyncio.sleep(20)
+    try:
+        return await optimize_publication(pub), None
+    except GeminiNotConfigured:
+        return None, "gemini_not_configured"
+    except Exception as exc:
+        return None, type(exc).__name__
+
+
+async def _register_many(pubs: list[dict]) -> dict:
+    new_items = []
+    for pub in pubs:
+        registered = await _register_publication(pub)
+        if registered:
+            new_items.append(registered)
+    return {"found": len(pubs), "new": len(new_items), "new_items": new_items}
+
+
+async def detect_substack_publications(collect_only: bool = False):
+    feed_url = os.getenv("SUBSTACK_RSS_URL", "").strip() or SUBSTACK_FEED_DEFAULT
+    # One retry on a transient fetch failure (a cold egress-proxy path timed
+    # out the first live run on 8 Nov 2026 while a direct fetch took ~1s).
+    last_exc: Exception | None = None
+    for _attempt in range(2):
+        try:
+            text = await fetch_feed_text(feed_url, timeout=60.0)
+            pubs = parse_rss_feed(text)
+            return pubs if collect_only else await _register_many(pubs)
+        except Exception as exc:
+            last_exc = exc
+    raise last_exc  # type: ignore[misc]
+
+
+async def detect_youtube_publications(collect_only: bool = False):
+    token, _conn = await access_token("youtube")
+    headers = {"Authorization": f"Bearer {token}"}
+    channel = await http_json("GET", "https://www.googleapis.com/youtube/v3/channels",
+                              headers=headers, params={"part": "contentDetails", "mine": "true"})
+    items = channel.get("items") or []
+    if not items:
+        return [] if collect_only else {"found": 0, "new": 0, "new_items": []}
+    uploads = (((items[0].get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads"))
+    listing = await http_json("GET", "https://www.googleapis.com/youtube/v3/playlistItems",
+                              headers=headers, params={"part": "snippet", "playlistId": uploads, "maxResults": 25})
+    pubs = []
+    for entry in listing.get("items") or []:
+        snip = entry.get("snippet") or {}
+        video_id = ((snip.get("resourceId") or {}).get("videoId"))
+        if not video_id:
+            continue
+        title = snip.get("title") or ""
+        text = (snip.get("description") or "")[:6000]
+        pubs.append({
+            "platform": "youtube", "external_id": video_id,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "title": title, "text": text,
+            "published_at": snip.get("publishedAt"),
+            "content_hash": None,
+        })
+    return pubs if collect_only else await _register_many(pubs)
+
+
+async def detect_linkedin_publications() -> dict:
+    """Attempt an authorized read of Ram's own LinkedIn posts.
+
+    The connected app holds openid/profile/email/w_member_social (write).
+    Reading the member's own posts requires r_member_social, which
+    LinkedIn grants separately; until it is granted this returns
+    permission_denied with the exact gap — it never scrapes.
+    """
+    token, _conn = await access_token("linkedin")
+    headers = {"Authorization": f"Bearer {token}", "Linkedin-Version": LINKEDIN_VERSION,
+               "X-Restli-Protocol-Version": "2.0.0"}
+    profile = await http_json("GET", "https://api.linkedin.com/v2/userinfo", headers=headers)
+    member = profile.get("sub")
+    if not member:
+        raise HTTPException(502, "LinkedIn userinfo returned no member id.")
+    try:
+        data = await http_json("GET", "https://api.linkedin.com/rest/posts", headers=headers,
+                               params={"q": "author", "author": f"urn:li:person:{member}",
+                                       "count": 25, "sortBy": "CREATED"})
+    except HTTPException as exc:
+        return {"status": "permission_denied", "found": 0, "new": 0, "new_items": [],
+                "detail": f"LinkedIn posts read refused (HTTP {exc.status_code}). "
+                          "Reading own posts requires the r_member_social permission, "
+                          "which the connected app does not currently hold."}
+    pubs = []
+    for entry in data.get("elements") or []:
+        post_id = entry.get("id") or entry.get("urn") or ""
+        commentary = ((entry.get("commentary") or ""))[:6000]
+        pubs.append({
+            "platform": "linkedin", "external_id": str(post_id),
+            "url": f"https://www.linkedin.com/feed/update/{post_id}/",
+            "title": commentary[:120], "text": commentary,
+            "published_at": None, "content_hash": None,
+        })
+    return await _register_many(pubs)
+
+
+async def run_publication_detection() -> dict:
+    results: dict[str, Any] = {}
+    for name, fn in (("substack", detect_substack_publications),
+                     ("youtube", detect_youtube_publications),
+                     ("linkedin", detect_linkedin_publications)):
+        try:
+            results[name] = await fn()
+        except HTTPException as exc:
+            results[name] = {"status": "error", "found": 0, "new": 0,
+                             "detail": str(exc.detail)[:300]}
+        except Exception as exc:
+            results[name] = {"status": "error", "found": 0, "new": 0,
+                             "detail": f"{type(exc).__name__}"}
+    total_new = sum(int(r.get("new") or 0) for r in results.values())
+    # Self-healing: each cycle also fills a few optimizations that failed
+    # earlier under Gemini rate limits, spaced far enough apart (30-minute
+    # cadence) to stay under the free-tier quota.
+    heal = {"attempted": 0, "fixed": 0, "still_failing": 0}
+    try:
+        heal = await _reoptimize(3)
+    except Exception:
+        pass
+    log.info("publication_detection complete new=%s per_source=%s reoptimize=%s",
+             total_new, {k: v.get("new") for k, v in results.items()}, heal)
+    return {"sources": results, "total_new": total_new, "reoptimize": heal}
+
+
+async def safe_publication_detection():
+    try:
+        await run_publication_detection()
+    except Exception:
+        pass
+
+
+class PublicationAnalyzeRequest(BaseModel):
+    platform: str = Field(min_length=1, max_length=40)
+    external_id: str = Field(min_length=1, max_length=300)
+    url: str = Field(min_length=1, max_length=2000)
+    title: str = Field(default="", max_length=500)
+    text: str = Field(default="", max_length=20000)
+    published_at: str | None = None
+
+
+@app.get("/api/publications")
+async def publications_list(limit: int = 50, platform: str | None = None):
+    limit = min(max(limit, 1), 200)
+    with db() as conn:
+        if platform:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM publications WHERE platform=? ORDER BY id DESC LIMIT ?", (platform, limit))]
+        else:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM publications ORDER BY id DESC LIMIT ?", (limit,))]
+    for row in rows:
+        try:
+            row["optimization"] = json.loads(row.pop("optimization_json")) if row.get("optimization_json") else None
+        except json.JSONDecodeError:
+            row["optimization"] = None
+    return {"publications": rows, "count": len(rows)}
+
+
+@app.post("/api/publications/detect")
+async def publications_detect():
+    return await run_publication_detection()
+
+
+async def _reoptimize(limit: int) -> dict:
+    """Fill optimizations that failed during a detection burst (Gemini
+    free-tier rate limits). Re-fetches source text, retries with pacing,
+    and updates both the register row and its queued approval payload."""
+    limit = min(max(limit, 1), 25)
+    fresh: dict[tuple[str, str], dict] = {}
+    for collector in (detect_substack_publications, detect_youtube_publications):
+        try:
+            for pub in await collector(collect_only=True):
+                fresh[(pub["platform"], pub["external_id"])] = pub
+        except Exception:
+            continue
+    with db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM publications WHERE optimization_json IS NULL ORDER BY id ASC LIMIT ?", (limit,))]
+    fixed = 0
+    still_failing = 0
+    for index, row in enumerate(rows):
+        if index:
+            await asyncio.sleep(6)
+        pub = fresh.get((row["platform"], row["external_id"])) or {
+            "platform": row["platform"], "external_id": row["external_id"],
+            "url": row["url"], "title": row["title"] or "", "text": "",
+            "published_at": row["published_at"],
+        }
+        optimization, opt_error = await _optimize_with_retry(pub)
+        if optimization is None:
+            still_failing += 1
+            continue
+        with db() as conn:
+            conn.execute("UPDATE publications SET optimization_json=? WHERE id=?",
+                         (json.dumps(optimization), row["id"]))
+            if row.get("approval_id"):
+                appr = conn.execute("SELECT payload_json FROM approval_queue WHERE id=?",
+                                    (row["approval_id"],)).fetchone()
+                if appr:
+                    try:
+                        payload = json.loads(appr["payload_json"])
+                    except (json.JSONDecodeError, TypeError):
+                        payload = {}
+                    payload["optimization"] = optimization
+                    payload["optimization_error"] = None
+                    conn.execute("UPDATE approval_queue SET payload_json=? WHERE id=?",
+                                 (json.dumps(payload), row["approval_id"]))
+        fixed += 1
+    return {"attempted": len(rows), "fixed": fixed, "still_failing": still_failing}
+
+
+@app.post("/api/publications/reoptimize")
+async def publications_reoptimize(limit: int = 10):
+    return await _reoptimize(limit)
+
+
+@app.post("/api/publications/analyze")
+async def publications_analyze(payload: PublicationAnalyzeRequest):
+    if payload.platform not in ("linkedin", "youtube", "substack"):
+        raise HTTPException(400, "platform must be one of: linkedin, youtube, substack.")
+    pub = {"platform": payload.platform, "external_id": payload.external_id,
+           "url": payload.url, "title": payload.title, "text": payload.text,
+           "published_at": payload.published_at}
+    from services.publication_engine import content_hash as _hash
+    pub["content_hash"] = _hash(payload.title, payload.text, payload.url)
+    try:
+        optimization = await optimize_publication(pub)
+    except GeminiNotConfigured:
+        raise HTTPException(503, NOT_CONFIGURED_MESSAGE)
+    registered = await _register_publication(pub, precomputed_optimization=optimization)
+    if registered is None:
+        return {"status": "duplicate", "publication_id": payload.external_id,
+                "optimization": optimization}
+    return {"status": "registered", **registered, "optimization": optimization}
+
+
+@app.get("/api/approvals/queue")
+async def approvals_queue():
+    with db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM approval_queue ORDER BY CASE status WHEN 'pending_approval' THEN 0 ELSE 1 END, id DESC"
+        )]
+    for row in rows:
+        try:
+            row["payload"] = json.loads(row.pop("payload_json")) if row.get("payload_json") else None
+        except json.JSONDecodeError:
+            row["payload"] = None
+    return {"approvals": rows, "count": len(rows)}
+
+
+@app.post("/api/approvals")
+async def approvals_create(payload: ApprovalCreateRequest):
+    with db() as conn:
+        cursor = conn.execute(
+            """INSERT INTO approval_queue(action_type,platform,title,payload_json,proposed_by,status,risk_level,created_at,expires_at)
+               VALUES(?,?,?,?,?,'pending_approval',?,?,?)""",
+            (payload.action_type, payload.platform, payload.title,
+             json.dumps(payload.payload), payload.proposed_by, payload.risk_level, iso(), _approval_expires_at()),
+        )
+        approval_id = cursor.lastrowid
+        audit = write_audit_log(
+            conn,
+            timestamp=iso(),
+            event_type="approval.requested",
+            actor=payload.proposed_by or "unknown",
+            target_entity=f"approval:{approval_id}",
+            outcome="pending_approval",
+            details={"action_type": payload.action_type, "platform": payload.platform, "risk_level": payload.risk_level},
+        )
+        row = dict(conn.execute("SELECT * FROM approval_queue WHERE id=?", (approval_id,)).fetchone())
+    row["payload"] = payload.payload
+    row.pop("payload_json", None)
+    return {**row, "audit_log_id": audit["id"]}
+
+
+@app.post("/api/approvals/{approval_id}/action")
+async def approvals_action(approval_id: int, payload: ApprovalActionRequest):
+    decision = payload.decision.strip().lower()
+    if decision not in ("approve", "reject"):
+        raise HTTPException(400, "decision must be 'approve' or 'reject'.")
+    new_status = "approved" if decision == "approve" else "rejected"
+    # Phase 1: expiry transition. db() rolls back when an exception escapes,
+    # so the expired status + audit row must commit on a clean exit BEFORE
+    # the 410 is raised outside the block.
+    expired = False
+    with db() as conn:
+        row = conn.execute("SELECT * FROM approval_queue WHERE id=?", (approval_id,)).fetchone()
+        if row and row["status"] == "pending_approval" and row["expires_at"] and row["expires_at"] < iso():
+            conn.execute("UPDATE approval_queue SET status='expired' WHERE id=?", (approval_id,))
+            write_audit_log(
+                conn,
+                timestamp=iso(),
+                event_type="approval.expired",
+                actor="system",
+                target_entity=f"approval:{approval_id}",
+                outcome="expired",
+                details={"expired_at": row["expires_at"]},
+            )
+            expired = True
+    if expired:
+        raise HTTPException(410, "Approval item has expired. Renew it to return it to pending_approval.")
+    # Phase 2: the decision itself.
+    with db() as conn:
+        row = conn.execute("SELECT * FROM approval_queue WHERE id=?", (approval_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Approval item not found.")
+        if row["status"] != "pending_approval":
+            raise HTTPException(409, f"Approval item is already {row['status']}.")
+        conn.execute(
+            "UPDATE approval_queue SET status=?,approved_by=?,approved_at=?,decision_notes=? WHERE id=?",
+            (new_status, payload.actor, iso(), payload.notes, approval_id),
+        )
+        audit = write_audit_log(
+            conn,
+            timestamp=iso(),
+            event_type=f"approval.{new_status}",
+            actor=payload.actor,
+            target_entity=f"approval:{approval_id}",
+            outcome=new_status,
+            details={"notes": payload.notes},
+        )
+        updated = dict(conn.execute("SELECT * FROM approval_queue WHERE id=?", (approval_id,)).fetchone())
+    try:
+        updated["payload"] = json.loads(updated.pop("payload_json")) if updated.get("payload_json") else None
+    except json.JSONDecodeError:
+        updated["payload"] = None
+    return {**updated, "audit_log_id": audit["id"], "audit_checksum": audit["tamper_proof_checksum"]}
+
+
+@app.post("/api/approvals/{approval_id}/renew")
+async def approvals_renew(approval_id: int, payload: ApprovalRenewRequest):
+    """v1.2: return an expired approval to pending with a fresh expiry."""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM approval_queue WHERE id=?", (approval_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Approval item not found.")
+        if row["status"] != "expired":
+            raise HTTPException(409, f"Only an expired approval can be renewed; this item is {row['status']}.")
+        new_expiry = _approval_expires_at()
+        conn.execute(
+            "UPDATE approval_queue SET status='pending_approval',expires_at=?,decision_notes=? WHERE id=?",
+            (new_expiry, payload.notes, approval_id),
+        )
+        audit = write_audit_log(
+            conn,
+            timestamp=iso(),
+            event_type="approval.renewed",
+            actor=payload.actor,
+            target_entity=f"approval:{approval_id}",
+            outcome="pending_approval",
+            details={"new_expires_at": new_expiry, "notes": payload.notes},
+        )
+        updated = dict(conn.execute("SELECT * FROM approval_queue WHERE id=?", (approval_id,)).fetchone())
+    try:
+        updated["payload"] = json.loads(updated.pop("payload_json")) if updated.get("payload_json") else None
+    except json.JSONDecodeError:
+        updated["payload"] = None
+    return {**updated, "audit_log_id": audit["id"], "audit_checksum": audit["tamper_proof_checksum"]}
+
+
+@app.get("/api/audit-logs")
+async def audit_logs(limit: int = 100):
+    limit = min(max(limit, 1), 500)
+    with db() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,))]
+    for row in rows:
+        try:
+            row["details"] = json.loads(row.pop("details_json")) if row.get("details_json") else {}
+        except json.JSONDecodeError:
+            row["details"] = {}
+    return {"audit_logs": rows, "count": len(rows)}
