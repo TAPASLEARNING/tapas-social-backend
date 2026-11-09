@@ -119,3 +119,17 @@ Services:
 New endpoints: `GET /api/dashboard/summary`, `GET /api/youtube/pillars`, `POST /api/youtube/titles/evaluate`, `POST /api/youtube/retention`, `POST /api/youtube/retention/optimize`, `POST /api/youtube/shorts/generate`, `POST /api/youtube/thumbnail/brief`, `POST /api/youtube/thumbnails/analyze`, `GET /api/youtube/videos`, `GET /api/github/stats`, `POST /api/github/audit`, `POST /api/github/launch-kit`, `POST /api/search/aeo/generate`, `POST /api/search/geo/audit`, `GET /api/search/seo/status`, `POST /api/search/keywords/research`, `GET /api/search/entities`, `POST /api/studio/generate-bundle`, `GET /api/studio/bundles`, `POST /api/crossplatform/draft`, `GET|POST /api/experiments`, `POST /api/experiments/evaluate`, `GET /api/approvals/queue`, `POST /api/approvals`, `POST /api/approvals/{id}/action`, `GET /api/audit-logs`.
 
 Optional configuration: `GITHUB_TOKEN` (public stats need no token; traffic metrics need push access). Live SEO metrics are provided by the Release 1.4 Google Search Console module (`GET /api/gsc/report`); `GET /api/search/seo/status` continues to report the Gemini-side SEO tooling state.
+
+
+## Release 1.6 — publishing and growth integration framework
+
+Release 1.6 starts the client requirement for end-to-end approved publication and measurable distribution. The provider capability registry distinguishes configured credentials from verified connections. It does not expose secrets and does not mark a provider connected merely because an environment variable exists.
+
+- ConnectSafely, MagicPost and Supergrow have capability contracts and secure environment-variable names. Their live adapters must complete an authenticated provider handshake before showing `connected`.
+- vidIQ and TubeBuddy are identified as YouTube research/optimization tools. Their direct API adapters remain disabled until a supported vendor API contract and account authorization are verified; no browser scraping or undocumented endpoint calls are used.
+- The 5,000-view threshold is tracked as a per-video campaign target using source-reported YouTube metrics. It is not a guaranteed view count and does not permit artificial views, view exchanges or bots.
+- YouTube upload remains blocked until the Google OAuth connection is re-consented with `https://www.googleapis.com/auth/youtube.upload` and the video upload route passes an end-to-end acceptance test.
+- LinkedIn personal-profile text publishing remains approval-gated. Company Page publishing needs separately approved organization permissions and page-admin authorization.
+- Release runtime version is reported as `1.6.0`.
+
+See [V1.6_IMPLEMENTATION_SCOPE.md](V1.6_IMPLEMENTATION_SCOPE.md) for the client acceptance scorecard and remaining production-readiness gates.
