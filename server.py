@@ -71,7 +71,7 @@ if not log.handlers:
 
 from services.publication_event_webhook import dispatch_publication_event  # noqa: E402
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 _STARTED_AT = time.time()
 
 # v1.2 scheduler reliability policy:
