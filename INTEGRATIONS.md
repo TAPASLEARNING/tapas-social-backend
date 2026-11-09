@@ -128,3 +128,17 @@ Set these values in the backend `.env` only. Never paste credentials into ChatGP
 | TubeBuddy | `TUBEBUDDY_API_KEY` | Disabled until vendor-supported API is verified |
 
 YouTube upload also requires re-consent to `youtube.upload`. Existing read/analytics scopes do not imply upload permission. Set `YOUTUBE_VIEW_TARGET=5000` to configure the reporting target. This target is measured from YouTube-reported metrics and is never represented as guaranteed.
+
+
+## Engagement Intelligence webhook (v1.6)
+
+This is a compliant alternative to engagement pods. After a confirmed successful, non-dry-run publish, the backend can send a signed HTTPS notification to an operator-owned endpoint when `ENGAGEMENT_INTELLIGENCE_ENABLED=true`.
+
+Environment:
+- `ENGAGEMENT_INTELLIGENCE_WEBHOOK_URL`: HTTPS endpoint (HTTP and embedded credentials are rejected).
+- `ENGAGEMENT_INTELLIGENCE_WEBHOOK_SECRET`: HMAC signing secret; store only in backend .env/secret manager.
+- `ENGAGEMENT_INTELLIGENCE_ENABLED`: opt-in; default false.
+
+The event includes platform, provider post ID/URL, approval ID, stable event ID and an explicit policy contract: comment suggestions are human-review-only; actual reactions/comments require human action; engagement pods are prohibited. Delivery uses a bounded timeout, three attempts by default, and an Idempotency-Key. Receiver should deduplicate on event_id. Delivery result is audited separately and does not undo a successfully published post.
+
+No automated likes, comments, follow actions, reciprocal engagement, or artificial engagement are implemented.
