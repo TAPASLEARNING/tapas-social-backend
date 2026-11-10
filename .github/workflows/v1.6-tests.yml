@@ -23,6 +23,17 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
       - name: Run complete backend and v1.6 test suite
-        run: pytest -q
+        run: |
+          set -e
+          # The suites share a SQLite database and TestClient state, so each
+          # module must run in its own process. A single-process 'pytest -q'
+          # errors (46 passed / 48 sqlite errors on the v1.6 merge commit);
+          # per-module runs pass 94/94.
+          for m in test_smoke test_v12_reliability test_v13_publications test_v14_gsc_apple test_v15_autopublish tests.test_publication_event_webhook test_engagement_intelligence_v16 test_publication_orchestrator_v16; do
+            echo "== $m"
+            python -m unittest "$m"
+          done
+          # Plain-function module: run singly under pytest.
+          python -m pytest -q test_v16_integrations.py
       - name: Compile backend and v1.6 modules
         run: python -m py_compile server.py services/provider_integrations_v16.py services/youtube_growth_targets.py services/publication_orchestrator_v16.py services/engagement_intelligence_engine.py
