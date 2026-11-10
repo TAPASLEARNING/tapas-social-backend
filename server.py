@@ -70,8 +70,9 @@ if not log.handlers:
     log.setLevel(_logging.INFO)
 
 from services.publication_event_webhook import dispatch_publication_event  # noqa: E402
+from services.engagement_intelligence_engine import dispatch_engagement_intelligence  # noqa: E402
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 _STARTED_AT = time.time()
 
 # v1.2 scheduler reliability policy:
@@ -2351,6 +2352,27 @@ async def _process_approved_item(row: dict, readiness: dict, dry_run: bool) -> s
                     write_audit_log(conn, timestamp=iso(), event_type="autopublish.publication_event_failed",
                         actor="publication-event-webhook", target_entity=f"approval:{approval_id}",
                         outcome="failed", details={"error": type(exc).__name__})
+            # Separate, opt-in Engagement Intelligence notification. This only
+            # notifies an owned webhook and queues human-review suggestions;
+            # it never dispatches likes, comments, or pod engagement.
+            try:
+                intelligence_status = await dispatch_engagement_intelligence(
+                    post_id=str(result["post_id"]), platform=provider,
+                    post_url=result.get("url"), approval_id=approval_id)
+                with db() as conn:
+                    write_audit_log(conn, timestamp=iso(),
+                        event_type="engagement_intelligence." + intelligence_status.get("status", "unknown"),
+                        actor="engagement-intelligence", target_entity=f"approval:{approval_id}",
+                        outcome=intelligence_status.get("status", "unknown"),
+                        details=intelligence_status)
+            except Exception as exc:  # never roll back a successful publication
+                log.warning("Engagement intelligence notification failed approval=%s error=%s",
+                            approval_id, type(exc).__name__)
+                with db() as conn:
+                    write_audit_log(conn, timestamp=iso(),
+                        event_type="engagement_intelligence.failed", actor="engagement-intelligence",
+                        target_entity=f"approval:{approval_id}", outcome="failed",
+                        details={"error": type(exc).__name__})
         return "executed"
     if attempts >= publish_engine.max_attempts():
         _record_execution(
